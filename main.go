@@ -3,107 +3,124 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/gorilla/mux"
 	"io"
 	"net/http"
-	"time"
+	"regexp"
 )
 
-// Estrutura para Brasil API
-type BrasilAPIResponse struct {
-	CEP          string `json:"cep"`
-	Street       string `json:"street"`
-	Neighborhood string `json:"neighborhood"`
-	City         string `json:"city"`
-	State        string `json:"state"`
-}
+const weatherAPIKey = "c6e34b41fac04d51ad5115119250603" // Substitua pela sua chave da WeatherAPI
 
 // Estrutura para ViaCEP
 type ViaCEPResponse struct {
-	CEP        string `json:"cep"`
-	Logradouro string `json:"logradouro"`
-	Bairro     string `json:"bairro"`
 	Localidade string `json:"localidade"`
 	UF         string `json:"uf"`
 }
 
-// Estrutura de endereço padronizada
-type Address struct {
-	CEP        string
-	Logradouro string
-	Bairro     string
-	Localidade string
-	UF         string
-	Source     string
+// Estrutura para WeatherAPI
+type WeatherAPIResponse struct {
+	Current struct {
+		TempC float64 `json:"temp_c"`
+	} `json:"current"`
 }
 
-// Função para fazer requisições e tratar os dados corretamente
-func fetchFromAPI(url, source string, resultChan chan<- Address, errChan chan<- error) {
-	client := http.Client{Timeout: 1 * time.Second}
-	resp, err := client.Get(url)
+// Estrutura de resposta do sistema
+type TemperatureResponse struct {
+	TempC float64 `json:"temp_C"`
+	TempF float64 `json:"temp_F"`
+	TempK float64 `json:"temp_K"`
+}
+
+// Valida se o CEP tem exatamente 8 dígitos numéricos
+func isValidCEP(cep string) bool {
+	return regexp.MustCompile(`^\d{8}$`).MatchString(cep)
+}
+
+// Busca cidade e estado pelo CEP via ViaCEP
+func getCityFromCEP(cep string) (string, string, error) {
+	url := fmt.Sprintf("http://viacep.com.br/ws/%s/json/", cep)
+	resp, err := http.Get(url)
 	if err != nil {
-		errChan <- fmt.Errorf("Erro ao acessar %s: %v", source, err)
-		return
+		return "", "", err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		errChan <- fmt.Errorf("Erro ao ler resposta de %s: %v", source, err)
+		return "", "", err
+	}
+
+	var data ViaCEPResponse
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", "", err
+	}
+
+	if data.Localidade == "" || data.UF == "" {
+		return "", "", fmt.Errorf("CEP não encontrado")
+	}
+	return data.Localidade, data.UF, nil
+}
+
+// Obtém a temperatura da cidade pela WeatherAPI
+func getTemperature(city string) (float64, error) {
+	url := fmt.Sprintf("http://api.weatherapi.com/v1/current.json?key=%s&q=%s", weatherAPIKey, city)
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var data WeatherAPIResponse
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, err
+	}
+
+	return data.Current.TempC, nil
+}
+
+func getCEPHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	cep := vars["cep"]
+
+	if !isValidCEP(cep) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid zipcode"})
 		return
 	}
 
-	var address Address
-	if source == "Brasil API" {
-		var data BrasilAPIResponse
-		if err := json.Unmarshal(body, &data); err != nil {
-			errChan <- fmt.Errorf("Erro ao decodificar resposta de %s: %v", source, err)
-			return
-		}
-		address = Address{
-			CEP:        data.CEP,
-			Logradouro: data.Street,
-			Bairro:     data.Neighborhood,
-			Localidade: data.City,
-			UF:         data.State,
-			Source:     source,
-		}
-	} else {
-		var data ViaCEPResponse
-		if err := json.Unmarshal(body, &data); err != nil {
-			errChan <- fmt.Errorf("Erro ao decodificar resposta de %s: %v", source, err)
-			return
-		}
-		address = Address{
-			CEP:        data.CEP,
-			Logradouro: data.Logradouro,
-			Bairro:     data.Bairro,
-			Localidade: data.Localidade,
-			UF:         data.UF,
-			Source:     source,
-		}
+	city, _, err := getCityFromCEP(cep)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "can not find zipcode"})
+		return
 	}
 
-	resultChan <- address
+	tempC, err := getTemperature(city)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "failed to fetch temperature"})
+		return
+	}
+
+	response := TemperatureResponse{
+		TempC: tempC,
+		TempF: tempC*1.8 + 32,
+		TempK: tempC + 273,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
-	cep := "01153000"
-	api1 := fmt.Sprintf("https://brasilapi.com.br/api/cep/v1/%s", cep)
-	api2 := fmt.Sprintf("http://viacep.com.br/ws/%s/json/", cep)
+	r := mux.NewRouter()
+	r.HandleFunc("/cep/{cep}", getCEPHandler).Methods("GET")
 
-	resultChan := make(chan Address, 2)
-	errChan := make(chan error, 2)
-
-	go fetchFromAPI(api1, "Brasil API", resultChan, errChan)
-	go fetchFromAPI(api2, "ViaCEP", resultChan, errChan)
-
-	select {
-	case result := <-resultChan:
-		fmt.Printf("API mais rápida: %s\n", result.Source)
-		fmt.Printf("Endereço: %s, %s, %s - %s, %s\n", result.Logradouro, result.Bairro, result.Localidade, result.UF, result.CEP)
-	case err := <-errChan:
-		fmt.Printf("Erro: %v\n", err)
-	case <-time.After(1 * time.Second):
-		fmt.Println("Erro: Timeout. Nenhuma API respondeu a tempo.")
-	}
+	fmt.Println("Servidor rodando na porta 8080...")
+	http.ListenAndServe(":8080", r)
 }
